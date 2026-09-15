@@ -4,7 +4,7 @@ from utils.config import get_config, get_userData
 from utils import norm
 from core.msg_builder import build_message, build_message_with_openai
 from core.browser import get_browser
-from playwright.sync_api import Response
+from playwright.sync_api import Response, TimeoutError as PlaywrightTimeoutError
 import time
 
 config = get_config()
@@ -28,22 +28,51 @@ def handle_response(response: Response):
         # print(f"URL: {response.url}")
         # print(f"状态码: {response.status}")
         try:
-            # 获取接口返回的 JSON 数据
+            # 这个接口偶尔会返回空 body、204 或 data=null（例如登录状态刷新时）。
+            # response.json() 对这些响应可能返回 None，因此必须在遍历前校验类型。
+            if not response.ok:
+                logger.debug(
+                    f"跳过好友信息响应：HTTP {response.status}，URL: {response.url}"
+                )
+                return
+
             json_data = response.json()
+            if not isinstance(json_data, dict):
+                logger.debug(
+                    f"跳过好友信息响应：返回值不是 JSON 对象（{type(json_data).__name__}），URL: {response.url}"
+                )
+                return
+
+            data = json_data.get("data")
+            if data is None:
+                return
+            if isinstance(data, dict):
+                # 兼容接口将列表包在 data.user_list / data.list 中的版本。
+                data = data.get("user_list", data.get("list", []))
+            if not isinstance(data, (list, tuple)):
+                logger.debug(
+                    f"跳过好友信息响应：data 不是列表（{type(data).__name__}），URL: {response.url}"
+                )
+                return
+
             # print("\n📦 响应 JSON 数据：")
             # print(json.dumps(json_data, indent=4, ensure_ascii=False))
-            for item in json_data.get("data", []):
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
                 short_id = item.get("short_id")  # short_id
                 unique_id = item.get("unique_id")  # unique_id
                 sec_uid = item.get("sec_uid", "")  # sec_uid 可能不存在，提供默认值为空字符串
-                nickname = norm(item.get("nickname"))  # 昵称
-                remark_name = norm(item.get("remark_name", nickname))  #  备注名，如果没有则使用昵称
-                userIDDict[remark_name] = [short_id, unique_id, sec_uid, nickname, remark_name]
+                nickname = norm(str(item.get("nickname") or ""))  # 昵称
+                remark_name = norm(str(item.get("remark_name") or nickname))  #  备注名，如果没有则使用昵称
+                if remark_name:
+                    userIDDict[remark_name] = [short_id, unique_id, sec_uid, nickname, remark_name]
         except Exception as e:
-            tb = traceback.extract_tb(e.__traceback__)
-            last = tb[-1]
-            print(f"解析响应失败: {e}")
-            print(f"文件: {last.filename}, 行号: {last.lineno}, 函数: {last.name}")
+            # 响应监听器不能让单个异常中断页面任务；保留 URL、状态码便于定位接口变化。
+            logger.warning(
+                f"解析好友信息响应失败：{e}（HTTP {response.status}，URL: {response.url}）",
+                exc_info=logger.isEnabledFor(10),
+            )
 
 
 def retry_operation(name, operation, retries=3, delay=2, *args, **kwargs):
@@ -66,6 +95,26 @@ def retry_operation(name, operation, retries=3, delay=2, *args, **kwargs):
             else:
                 logger.error(f"{name} 失败，已达到最大重试次数，错误：{e}")
                 raise
+
+
+def goto_chat(page):
+    """打开聊天页。
+
+    抖音页面的统计、广告等资源可能一直阻塞 ``load`` 事件；聊天 DOM 已可用时，
+    不应因为等待这些非关键资源而把整个任务拖到 120 秒超时。
+    """
+    try:
+        return page.goto(
+            "https://www.douyin.com/chat",
+            wait_until="domcontentloaded",
+            timeout=config["browserTimeout"],
+        )
+    except PlaywrightTimeoutError:
+        # 超时并不一定代表导航失败：Playwright 可能已经完成了 DOM 加载。
+        if page.url.rstrip("/").endswith("douyin.com/chat") or "/chat" in page.url:
+            logger.warning("聊天页等待非关键资源超时，继续使用已加载页面")
+            return None
+        raise
 
 def checkTargetName(targetName, targets):
     """检查targetName是否为目标
@@ -235,10 +284,9 @@ def do_user_task(browser, username, cookies, targets):
     # 打开抖音网页聊天页面
     retry_operation(
         "打开抖音网页聊天页面",
-        page.goto,
+        lambda: goto_chat(page),
         retries=config["taskRetryTimes"],
         delay=5,
-        url="https://www.douyin.com/chat",
     )
 
     time.sleep(5)  # 等待5秒让过可能存在的弹窗
